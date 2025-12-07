@@ -1,0 +1,238 @@
+name: Salesforce Deployment (Delta + Tags + Logging)
+
+# -----------------------------------------
+# GLOBAL ENV — Always resolves to TARGET branch name
+# -----------------------------------------
+env:
+  BRANCH_NAME: ${{ github.base_ref || github.ref_name }}
+
+on:
+  pull_request:
+    branches: [qa, uat, preprod, main]
+  push:
+    branches: [qa, uat, preprod, main]
+
+jobs:
+  salesforce-deployment:
+    runs-on: ubuntu-latest
+
+    steps:
+      # -----------------------------------------------------
+      # CHECKOUT
+      # -----------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show branch info
+        run: |
+          echo "📌 TARGET BRANCH (BRANCH_NAME): $BRANCH_NAME"
+          echo "📌 SOURCE BRANCH (HEAD):        ${{ github.head_ref }}"
+          echo "📌 TARGET BRANCH (BASE):        ${{ github.base_ref }}"
+          echo "📌 SHA (HEAD COMMIT):           ${{ github.sha }}"
+
+      # -----------------------------------------------------
+      # INSTALL SF CLI
+      # -----------------------------------------------------
+      - name: Install Salesforce CLI
+        run: |
+          echo "📦 Installing Salesforce CLI..."
+          npm install --global @salesforce/cli
+          sf --version
+          echo "✅ SF CLI Installed."
+
+      # -----------------------------------------------------
+      # INSTALL SFDX-GIT-DELTA
+      # -----------------------------------------------------
+      - name: Install sfdx-git-delta plugin
+        run: |
+          echo "📦 Installing sfdx-git-delta plugin..."
+          echo y | sf plugins install sfdx-git-delta
+          echo "✅ sfdx-git-delta installed."
+
+      # -----------------------------------------------------
+      # AUTHENTICATE ORG (BY TARGET BRANCH)
+      # -----------------------------------------------------
+      - name: Authenticate org
+        shell: bash
+        run: |
+          echo "🔐 Authenticating for TARGET branch: $BRANCH_NAME"
+
+          case "$BRANCH_NAME" in
+            qa)
+              alias="qa"
+              echo "${{ secrets.QA_AUTH_URL }}" > auth.txt
+              ;;
+            uat)
+              alias="uat"
+              echo "${{ secrets.UAT_AUTH_URL }}" > auth.txt
+              ;;
+            preprod)
+              alias="preprod"
+              echo "${{ secrets.PREPROD_AUTH_URL }}" > auth.txt
+              ;;
+            main)
+              alias="prod"
+              echo "${{ secrets.PROD_AUTH_URL }}" > auth.txt
+              ;;
+            *)
+              echo "❌ ERROR: Unsupported branch: $BRANCH_NAME"
+              exit 1
+              ;;
+          esac
+
+          echo "➡ Using alias: $alias"
+
+          sf org login sfdx-url \
+            --sfdx-url-file auth.txt \
+            --alias "$alias"
+
+          echo "ORG_ALIAS=$alias" >> $GITHUB_ENV
+          echo "✅ Authentication successful."
+
+      # -----------------------------------------------------
+      # DETERMINE DELTA BASELINE
+      # -----------------------------------------------------
+      - name: Determine delta baseline
+        id: baseline
+        shell: bash
+        run: |
+          echo "🔎 Determining baseline for delta..."
+
+          # Pull Request logic
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            TARGET_BRANCH="${{ github.base_ref }}"
+            SOURCE_SHA="${{ github.sha }}"
+
+            echo "📌 Pull Request detected."
+            echo "📌 Target branch: $TARGET_BRANCH"
+            echo "📌 Source HEAD SHA: $SOURCE_SHA"
+
+            git fetch origin $TARGET_BRANCH --depth=1
+            TARGET_SHA=$(git rev-parse origin/$TARGET_BRANCH)
+
+            echo "📌 FROM: $TARGET_SHA"
+            echo "📌 TO:   $SOURCE_SHA"
+
+            echo "FROM=$TARGET_SHA" >> $GITHUB_OUTPUT
+            echo "TO=$SOURCE_SHA"   >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Push to main → use latest tag
+          if [[ "$BRANCH_NAME" == "main" ]]; then
+            latest_tag=$(git tag --list "v*" --sort=-v:refname | head -n 1)
+
+            if [[ -z "$latest_tag" ]]; then
+              echo "⚠ No prod tags found. Using first commit."
+              FROM_SHA=$(git rev-list --max-parents=0 HEAD)
+            else
+              echo "📌 Using latest PROD tag: $latest_tag"
+              FROM_SHA="$latest_tag"
+            fi
+
+            echo "FROM=$FROM_SHA" >> $GITHUB_OUTPUT
+            echo "TO=${{ github.sha }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # All other push branches
+          echo "📌 Push event on branch $BRANCH_NAME"
+          FROM_SHA="${{ github.event.before }}"
+
+          if [[ -z "$FROM_SHA" ]]; then
+            echo "⚠ github.event.before empty — using merge-base fallback."
+            git fetch origin $BRANCH_NAME --depth=1
+            FROM_SHA=$(git merge-base origin/$BRANCH_NAME HEAD)
+          fi
+
+          echo "FROM=$FROM_SHA" >> $GITHUB_OUTPUT
+          echo "TO=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      # -----------------------------------------------------
+      # GENERATE DELTA
+      # -----------------------------------------------------
+      - name: Create delta package
+        run: |
+          echo "📦 Generating delta..."
+          echo "FROM = ${{ steps.baseline.outputs.FROM }}"
+          echo "TO   = ${{ steps.baseline.outputs.TO }}"
+
+          mkdir sgd_delta
+
+          sf sgd source delta \
+            --from "${{ steps.baseline.outputs.FROM }}" \
+            --to   "${{ steps.baseline.outputs.TO }}" \
+            --generate-delta \
+            --output-dir sgd_delta
+
+          echo "📄 package.xml:"
+          cat sgd_delta/package/package.xml || echo "⚠ No package.xml found."
+
+      # -----------------------------------------------------
+      # DELTA CHECK
+      # -----------------------------------------------------
+      - name: Check if delta is empty
+        id: deltacheck
+        run: |
+          echo "🔎 Checking delta contents..."
+
+          if ! grep -q "<types>" sgd_delta/package/package.xml 2>/dev/null; then
+            echo "⚠ No deployable changes found. Skipping validation/deployment and tag increment."
+            echo "EMPTY_DELTA=true" >> $GITHUB_OUTPUT
+          else
+            echo "✅ Delta contains deployable metadata."
+            echo "EMPTY_DELTA=false" >> $GITHUB_OUTPUT
+          fi
+
+      # -----------------------------------------------------
+      # VALIDATE ON PR
+      # -----------------------------------------------------
+      - name: Validate deployment (PR only)
+        if: github.event_name == 'pull_request' && steps.deltacheck.outputs.EMPTY_DELTA == 'false'
+        run: |
+          echo "🔍 Running validation for PR..."
+          sf project deploy start \
+            --source-dir sgd_delta \
+            --target-org "$ORG_ALIAS" \
+            --dry-run \
+            --test-level RunLocalTests \
+            --wait 60
+          echo "✅ Validation complete."
+
+      # -----------------------------------------------------
+      # DEPLOY ON PUSH
+      # -----------------------------------------------------
+      - name: Deploy delta (merge only)
+        if: github.event_name == 'push' && steps.deltacheck.outputs.EMPTY_DELTA == 'false'
+        run: |
+          echo "🚀 Deploying delta for branch: $BRANCH_NAME"
+          sf project deploy start \
+            --source-dir sgd_delta \
+            --target-org "$ORG_ALIAS" \
+            --test-level RunLocalTests \
+            --wait 60
+          echo "✅ Deployment complete."
+
+      # -----------------------------------------------------
+      # AUTO-INCREMENT VERSION (MAIN ONLY)
+      # -----------------------------------------------------
+      - name: Auto-increment patch version
+        if: github.event_name == 'push' && env.BRANCH_NAME == 'main' && steps.deltacheck.outputs.EMPTY_DELTA == 'false'
+        shell: bash
+        run: |
+          echo "🏷 Auto-incrementing patch version..."
+
+          latest_tag=$(git tag --list "v*" --sort=-v:refname | head -n 1)
+          version=${latest_tag#v}
+
+          IFS='.' read -r major minor patch <<< "$version"
+          patch=$((patch + 1))
+          new_tag="v$major.$minor.$patch"
+
+          echo "🏷 Creating new tag: $new_tag"
+          git tag "$new_tag"
+          git push origin "$new_tag"
+
+          echo "✅ Patch version updated to: $new_tag"
