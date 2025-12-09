@@ -5,6 +5,7 @@ public with sharing class AccountHelper {
      * No exceptions. If access is denied, returns empty list.
      * test test arkx 2
      * test test change 2
+     * S2ENHRO-1241 deploy
      */
     public static List<Account> getAccountsByIndustry(String industryName) {
 
