@@ -3,7 +3,7 @@ public with sharing class AccountHelper {
     /**
      * Returns a list of Accounts by Industry.
      * No exceptions. If access is denied, returns empty list.
-     * test test
+     * test test change 2
      */
     public static List<Account> getAccountsByIndustry(String industryName) {
 
